@@ -1,0 +1,139 @@
+---
+title: "Simulation Study, Scenario 2"
+author: "Hannes Riebl"
+format: gfm
+params:
+  nsites: 40
+  nspecies: 26
+  job: 42
+---
+
+```{r}
+#| label: sim-predictor
+
+library(here)
+library(reticulate)
+library(rliesel)
+
+set.seed(4000 + params$job)
+
+seeds <- sample.int(2147483647, 10)
+
+N <- params$nsites
+M <- params$nspecies
+y <- matrix(1, nrow = N, ncol = M)
+df <- data.frame(x1 = runif(N), x2 = runif(N))
+
+gb <- liesel(
+  response = y,
+  predictors = list(
+    eta = predictor(
+      formula = ~ -1 + x1 + x2,
+      inverse_link = "Identity"
+    )
+  ),
+  data = df,
+  builder = TRUE
+)
+```
+
+```{python}
+#| label: sim-model
+
+import liesel.model as lsl
+import mscm as occ
+
+pdt_vars = {var.name: var for var in r.gb.vars}
+
+y = r.y.astype("float32")
+x = pdt_vars["eta_p0_X"].value
+model = occ.make_model(y, x)
+
+_, occ_vars = model.pop_nodes_and_vars()
+
+gb = lsl.GraphBuilder().add(occ_vars["y"])
+gb.replace_var(occ_vars["eta"], pdt_vars["eta_pdt"])
+
+pdt_vars["eta_p0_m"].value = 0.0
+pdt_vars["eta_p0_s"].value = 1.0
+
+occ_vars["gamma"].dist_node.set_inputs(loc=0.0, scale=1.0)
+
+sim_model = gb.build_model()
+occ.simulate_model(sim_model, seed=r.seeds[0])
+y = sim_model.vars["y"].value
+```
+
+```{r}
+#| label: mcmc-predictor
+
+gb <- liesel(
+  response = y,
+  predictors = list(
+    eta = predictor(
+      formula = ~ -1 + x1 + x2,
+      inverse_link = "Identity"
+    )
+  ),
+  data = df,
+  builder = TRUE
+)
+```
+
+```{python}
+#| label: mcmc-model
+
+import tensorflow_probability.substrates.jax.bijectors as tfb
+
+pdt_vars = {var.name: var for var in r.gb.vars}
+
+model = occ.make_model(y, x)
+
+_, occ_vars = model.pop_nodes_and_vars()
+
+gb = lsl.GraphBuilder().add(occ_vars["y"])
+gb.replace_var(occ_vars["eta"], pdt_vars["eta_pdt"])
+gb.transform(occ_vars["mu"], tfb.Exp)
+mcmc_model = gb.build_model()
+```
+
+```{python}
+#| label: mcmc
+
+import liesel.goose as gs
+
+builder = gs.EngineBuilder(seed=r.seeds[1], num_chains=4)
+builder.set_duration(warmup_duration=1000, posterior_duration=1000)
+builder.set_model(lsl.GooseModel(mcmc_model))
+builder.set_initial_values(mcmc_model.state)
+
+builder.add_kernel(occ.make_z_gibbs_kernel(mcmc_model))
+builder.add_kernel(gs.NUTSKernel(["mu_transformed"]))
+builder.add_kernel(gs.NUTSKernel(["gamma"]))
+builder.add_kernel(gs.NUTSKernel(["eta_p0_beta"]))
+
+builder.positions_included = ["psi", "mu"]
+
+engine = builder.build()
+engine.sample_all_epochs()
+```
+
+```{python}
+#| label: summary
+
+import jax
+import numpy as np
+
+truth = jax.tree_map(lambda var: np.asarray(var.value), dict(sim_model.vars))
+
+results = engine.get_results()
+summary = gs.Summary(results)
+summary = jax.tree_map(np.asarray, summary.quantities)
+```
+
+```{r}
+#| label: results
+
+results <- list(params = params, truth = py$truth, summary = py$summary)
+saveRDS(results, "results.rds")
+```

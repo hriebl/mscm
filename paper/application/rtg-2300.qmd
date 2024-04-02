@@ -1,0 +1,593 @@
+---
+title: "RTG 2300 Application"
+author: "Hannes Riebl"
+format: gfm
+fig-dpi: 300
+params:
+  taxon: col
+  distribution: negbin
+---
+
+```{r}
+#| label: setup-r
+
+library(dplyr)
+library(ggplot2)
+library(here)
+library(lubridate)
+library(mgcv)
+library(parallel)
+library(patchwork)
+library(purrr)
+library(readr)
+library(reticulate)
+library(rliesel)
+library(sf)
+library(stringr)
+library(tidyr)
+library(units)
+
+set.seed(1337)
+
+theme_set(theme_minimal())
+
+theme_update(
+  text = element_text(family = "TeX Gyre Heros"),
+  axis.text = element_text(color = "black", size = rel(1.0)),
+  axis.text.x = element_text(margin = margin(2.2, 0, 4.4, 0)),
+  strip.text = element_text(color = "black", size = rel(1.0)),
+  strip.text.x = element_text(vjust = 0.1),
+)
+```
+
+```{python}
+#| label: setup-python
+
+import arviz as az
+import liesel.experimental.arviz
+import liesel.goose as gs
+import liesel.model as lsl
+import numpy as np
+import pandas as pd
+import tensorflow_probability.substrates.jax.bijectors as tfb
+import tensorflow_probability.substrates.jax.distributions as tfd
+
+import mscm
+
+negbin = r.params["distribution"] == "negbin"
+poisson = r.params["distribution"] == "poisson"
+yule = r.params["distribution"] == "yule"
+
+gs.Summary._repr_markdown_ = gs.Summary._repr_html_
+pd.options.display.html.border = 0
+```
+
+```{r}
+#| label: apa
+
+# apa <- read_tsv(
+#   here("paper", "data", "rtg-2300-apa.txt"),
+#   locale = locale(decimal_mark = ","),
+#   col_types = c(id_plot = "c")
+# )
+#
+# apa <- apa %>%
+#   mutate(
+#     year = year(dmy_hms(census_date)),
+#     species = case_when(
+#       id_tree_species == "211" ~ "beech",
+#       id_tree_species == "511" ~ "spruce",
+#       id_tree_species == "611" ~ "douglas"
+#     )
+#   ) %>%
+#   filter(
+#     str_ends(id_plot_misc, "_plot"),
+#     species %in% c("beech", "spruce", "douglas")
+#   ) %>%
+#   select(plot = id_plot, year, species, apa_size_prop) %>%
+#   pivot_wider(
+#     names_from = species,
+#     values_from = apa_size_prop,
+#     names_prefix = "apa_",
+#     values_fill = 0
+#   ) %>%
+#   filter(!is.na(apa_beech), !is.na(apa_spruce), !is.na(apa_douglas)) %>%
+#   group_by(plot) %>%
+#   filter(year == min(year)) %>%
+#   ungroup() %>%
+#   select(-year)
+
+apa <- readRDS(here("paper", "data", "rtg-2300-apa.rds"))
+```
+
+```{r}
+#| label: coords
+
+# coords <- read_tsv(
+#   here("paper", "data", "rtg-2300-coords.txt"),
+#   locale = locale(decimal_mark = ","),
+#   col_types = c(id_plot = "c")
+# )
+#
+# coords <- coords %>%
+#   filter(object_label == "center") %>%
+#   st_as_sf(crs = 25832, wkt = "wkt") %>%
+#   mutate(
+#     x = st_coordinates(.)[, "X"],
+#     y = st_coordinates(.)[, "Y"],
+#     max_sd = max(sd(x), sd(y)),
+#     x = (x - mean(x)) / max_sd,
+#     y = (y - mean(y)) / max_sd
+#   ) %>%
+#   select(plot = id_plot, x, y) %>%
+#   st_drop_geometry()
+
+coords <- readRDS(here("paper", "data", "rtg-2300-coords.rds"))
+
+max_dist <- coords %>%
+  separate(plot, c("site", "plot")) %>%
+  group_by(site) %>%
+  summarize(max_dist = max(dist(cbind(x, y))), .groups = "drop")
+
+# max(max_dist$max_dist) ~= 0.0741 ~= 5 km
+matern <- function(d, r) (1 + d/r) * exp(-d/r)
+
+range_matern <- uniroot(
+  function(r) matern(max(max_dist$max_dist), r) - 0.001,
+  interval = c(0.001, 1000)
+)
+
+range_matern <- range_matern$root
+dist_mat <- as.matrix(dist(cbind(coords$x, coords$y)))
+cor_mat <- matern(dist_mat, range_matern)
+
+df <- expand_grid(x = coords$plot, y = coords$plot)
+df$cor <- as.vector(cor_mat)
+
+ggplot(df) +
+  geom_point(aes(x, y, color = cor, size = ifelse(cor < 0.001, NA, cor))) +
+  scale_color_viridis_c(name = "Correlation", option = "turbo") +
+  scale_size_area(guide = "none", max_size = 2) +
+  scale_y_discrete(limits = rev) +
+  coord_fixed() +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(),
+        axis.title = element_blank())
+
+covariates <- left_join(apa, coords, by = "plot")
+```
+
+```{r}
+#| label: species
+
+# load(here("paper", "data", "rtg-2300-species.RData"))
+# species <- ungroup(species_tbl)
+# rm(species_tbl)
+#
+# if (params$taxon == "sma") {
+#   species <- species %>%
+#     filter(taxon == "sma") %>%
+#     group_by(id_plot, species, taxon) %>%
+#     summarize(count = sum(count), .groups = "drop")
+# }
+#
+# species <- species %>%
+#   filter(taxon == params$taxon) %>%
+#   mutate(species = str_to_lower(species)) %>%
+#   select(plot = id_plot, species, count) %>%
+#   pivot_wider(names_from = species, values_from = count, values_fill = 0)
+
+if (params$taxon != "col") {
+  stop(paste("data not available for taxon", params$taxon))
+}
+
+species <- read_tsv(here("paper", "data", "rtg-2300-col.tsv"), skip = 37)
+
+species <- species %>%
+  select(plot = 6, species = 9, count = 10) %>%
+  mutate(species = str_to_lower(str_replace(species, "([^ ]+) +([^ ]+).*", "\\1_\\2"))) %>%
+  pivot_wider(names_from = species, values_from = count, values_fill = 0) %>%
+  arrange(plot)
+
+y <- as.matrix(select(species, -plot))
+rownames(y) <- species$plot
+
+y <- y[, c(
+  "ceratophysella_denticulata",
+  "folsomia_manolachei",
+  "paratullbergia_callipygos",
+  "parisotoma_notabilis",
+  "sminthurinus_aureus",
+  "hypogastrura_burkilli",
+  "isotomiella_minor",
+  "lepidocyrtus_lanuginosus",
+  "protaphorura_armata",
+  "willemia_denisi",
+  "pogonognathellus_flavescens",
+  "xenyllodes_armata",
+  "desoria_violacea",
+  "folsomia_quadrioculata",
+  "frisea_mirabilis",
+  "lepidocyrtus_cyaneus",
+  "protaphorura_quadriocellata",
+  "lepidocyrtus_lignorum",
+  "orchesella_bifasciata",
+  "pseudosinella_alba",
+  "entomobrya_nivalis",
+  "mesaphorura_macrochaeta",
+  "willemia_anophthalma",
+  "dicyrtomina_ornata",
+  "lepidocyrtus_violaceus",
+  "neanura_muscorum"
+)]
+
+quintet <- as.numeric(str_split_i(species$plot, "\\.", 1))
+landscape <- 1 * rbind(quintet <= 4, quintet >= 5)
+```
+
+```{r}
+#| label: predictor
+
+# the penalty matrix is diagonalized here:
+# https://github.com/cran/mgcv/blob/1.8-41/R/smooth.r#L3652-L3653
+
+df <- left_join(species["plot"], covariates, by = "plot")
+
+gb <- liesel(
+  response = y,
+  predictors = list(
+    eta = predictor(
+      formula = ~ -1 + apa_spruce + apa_douglas + s(x, y, k = 40, bs = "gp", m = c(-3, range_matern)),
+      inverse_link = "Identity"
+    )
+  ),
+  data = df,
+  builder = TRUE
+)
+```
+
+```{python}
+#| label: model
+
+gb = r.gb
+
+pdt_vars = {var.name: var for var in gb.vars}
+
+y = r.y.astype("float32")
+x = pdt_vars["eta_p0_X"].value
+landscape = r.landscape
+
+model = mscm.make_model(y, x, landscape)
+mscm_nodes, mscm_vars = model.pop_nodes_and_vars()
+
+if negbin:
+    dispersion = lsl.Param(
+        value=1.0,
+        distribution=lsl.Dist(tfd.Normal, loc=0.0, scale=10.0),
+        name="dispersion",
+    )
+
+    mscm_vars["n"].dist_node = lsl.Dist(
+        mscm.NegBinLocScale,
+        loc=mscm_vars["lambda"],
+        scale=dispersion,
+    )
+
+if yule:
+    mscm_vars["n"].dist_node = lsl.Dist(mscm.Yule, loc=mscm_vars["lambda"])
+
+log_lik_pointwise = lsl.Var(
+    value=lsl.Calc(
+        lambda *args: sum(args),
+        mscm_vars["n"].dist_node,
+        mscm_vars["y"].dist_node,
+    ),
+    name="log_lik_pointwise",
+)
+
+gb = lsl.GraphBuilder().add(
+    mscm_vars["n"],
+    mscm_vars["y"],
+    mscm_vars["richness"],
+    mscm_vars["shannon"],
+    mscm_vars["richness_landscape"],
+    mscm_vars["shannon_landscape"],
+    log_lik_pointwise,
+)
+
+if negbin:
+    gb.transform(dispersion, tfb.Exp)
+
+gb.transform(mscm_vars["mu"], tfb.Exp)
+gb.replace_var(mscm_vars["eta"], pdt_vars["eta_pdt"])
+model = gb.build_model()
+lsl.plot_vars(model)
+```
+
+```{python}
+#| label: mcmc
+
+builder = gs.EngineBuilder(seed=42, num_chains=4)
+builder.set_duration(warmup_duration=1000, posterior_duration=1000)
+builder.set_model(lsl.GooseModel(model))
+builder.set_initial_values(model.state)
+
+if negbin:
+    builder.add_kernel(gs.NUTSKernel(["dispersion_transformed"]))
+
+builder.add_kernel(mscm.make_z_gibbs_kernel(model))
+builder.add_kernel(gs.NUTSKernel(["mu_transformed"]))
+builder.add_kernel(gs.NUTSKernel(["gamma"]))
+builder.add_kernel(gs.NUTSKernel(["eta_p0_beta"]))
+builder.add_kernel(gs.NUTSKernel(["eta_np0_beta"]))
+builder.add_kernel(lsl.tau2_gibbs_kernel(model.groups()["eta_np0"]))
+
+builder.positions_included = [
+    "mu",
+    "richness",
+    "shannon",
+    "richness_landscape",
+    "shannon_landscape",
+    "log_lik_pointwise",
+]
+
+engine = builder.build()
+engine.sample_all_epochs()
+```
+
+```{python}
+#| label: summary
+
+results = engine.get_results()
+samples = results.get_posterior_samples()
+
+gs.Summary(
+    results,
+    deselected=[
+        "z",
+        "mu",
+        "richness",
+        "shannon",
+        "richness_landscape",
+        "shannon_landscape",
+        "log_lik_pointwise",
+    ],
+)
+```
+
+```{python}
+#| label: trace
+
+if negbin:
+    foo = gs.plot_trace(results, params=["dispersion_transformed"])
+
+foo = gs.plot_trace(results, params=["mu_transformed"])
+foo = gs.plot_trace(results, params=["gamma"])
+foo = gs.plot_trace(results, params=["eta_p0_beta"])
+foo = gs.plot_trace(results, params=["eta_np0_beta"])
+foo = gs.plot_trace(results, params=["eta_np0_tau2"])
+```
+
+```{python}
+#| label: waic
+
+idat = liesel.experimental.arviz.to_arviz_inference_data(results)
+
+llptw = idat.posterior["log_lik_pointwise"]
+idat.posterior = idat.posterior.drop("log_lik_pointwise")
+idat.add_groups({"log_likelihood": {"observed": llptw}})
+az.waic(idat)
+```
+
+```{python}
+def flat_chain(key):
+    shape = (-1,) + model.vars[key].value.shape
+    return np.asarray(samples[key]).reshape(shape)
+
+richness = flat_chain("richness")
+```
+
+```{r}
+#| label: richness-plot
+
+richness <- py$richness
+
+p <- tibble(
+  plot = rep(df$plot, each = nrow(richness)),
+  landscape = factor(plot < 5, c(FALSE, TRUE), c("North", "South")),
+  richness = as.vector(richness)
+)
+
+p <- p %>%
+  group_by(landscape, plot, richness) %>%
+  summarize(prob = n() / nrow(!!richness), .groups = "drop")
+
+gg1 <- ggplot(p) +
+  geom_tile(aes(richness, plot, fill = landscape, height = prob),
+            color = "black", linewidth = 0.3) +
+  labs(x = "Species richness", y = "Experimental plot") +
+  theme(axis.text.y = element_blank(), legend.position = "none")
+```
+
+```{python}
+richness = flat_chain("richness_landscape")
+```
+
+```{r}
+#| label: richness-landscape
+
+richness <- py$richness
+
+p <- tibble(
+  landscape = rep(c("South", "North"), each = nrow(richness)),
+  richness = as.vector(richness)
+)
+
+p <- p %>%
+  mutate(landscape = factor(landscape, c("North", "South"))) %>%
+  group_by(landscape, richness) %>%
+  summarize(prob = n() / nrow(!!richness), .groups = "drop")
+
+gg2 <- ggplot(p) +
+  geom_tile(aes(richness, landscape, fill = landscape, height = prob),
+            color = "black", linewidth = 0.3) +
+  scale_y_discrete(limits = rev) +
+  labs(x = NULL, y = "Landscape", title = "Species richness") +
+  theme(legend.position = "none")
+
+if (params$taxon == "col") {
+  gg2 <- gg2 + scale_x_continuous(breaks = seq(15, 26, by = 2))
+}
+
+if (params$taxon == "veg") {
+  gg2 <- gg2 + scale_x_continuous(limits = c(50, 92))
+}
+```
+
+```{python}
+shannon = flat_chain("shannon")
+```
+
+```{r}
+#| label: shannon-plot
+
+shannon <- py$shannon
+
+p <- tibble(
+  plot = rep(df$plot, each = nrow(shannon)),
+  landscape = factor(plot < 5, c(FALSE, TRUE), c("North", "South")),
+  shannon = as.vector(shannon)
+)
+
+p <- p %>%
+  group_by(plot) %>%
+  slice_sample(n = 5000) %>%
+  ungroup()
+
+gg3 <- ggplot(p) +
+  geom_jitter(aes(shannon, plot, color = landscape),
+              alpha = 0.05, width = 0, height = 0.3) +
+  geom_boxplot(aes(shannon, plot), fill = NA, outlier.shape = NA) +
+  labs(x = "Shannon diversity", y = NULL) +
+  theme(axis.text.y = element_blank(), legend.position = "none")
+```
+
+```{python}
+shannon = flat_chain("shannon_landscape")
+```
+
+```{r}
+#| label: shannon-landscape
+
+shannon <- py$shannon
+
+p <- tibble(
+  landscape = rep(c("South", "North"), each = nrow(shannon)),
+  shannon = as.vector(shannon)
+)
+
+p <- p %>%
+  mutate(landscape = factor(landscape, c("North", "South"))) %>%
+  group_by(landscape) %>%
+  slice_sample(n = 5000) %>%
+  ungroup()
+
+gg4 <- ggplot(p) +
+  geom_jitter(aes(shannon, landscape, color = landscape),
+              alpha = 0.3, width = 0) +
+  geom_boxplot(aes(shannon, landscape), fill = NA, outlier.shape = NA) +
+  scale_y_discrete(limits = rev) +
+  labs(x = NULL, y = NULL, title = "Shannon diversity") +
+  theme(axis.text.y = element_blank(), legend.position = "none")
+```
+
+```{r}
+#| label: diversity-geo
+#| fig-width: 10
+#| fig-height: 8
+
+(gg2 + gg4) / (gg1 + gg3)
+```
+
+```{python}
+beta = flat_chain("eta_p0_beta")
+gamma = flat_chain("gamma")
+mu = flat_chain("mu")
+```
+
+```{r}
+#| label: diversity-apa
+
+beta <- apply(py$beta, 1, identity, simplify = FALSE)
+gamma <- apply(py$gamma, 1, identity, simplify = FALSE)
+mu <- apply(py$mu, 1, identity, simplify = FALSE)
+
+expected_richness <- function(x, beta, gamma, mu) {
+  eta <- drop(x %*% beta)
+  psi <- 1 / (1 + exp(-outer(eta, gamma, "+")))
+  rowSums(psi)
+}
+
+expected_shannon <- function(x, beta, gamma, mu) {
+  eta <- drop(x %*% beta)
+  psi <- 1 / (1 + exp(-outer(eta, gamma, "+")))
+
+  sim <- map(1:5000, function(i) {
+    z <- rbinom(length(psi), 1, psi)
+    z <- matrix(z, nrow = ncol(psi), byrow = TRUE)
+    z_mu <- t(z * mu)
+
+    p <- z_mu / ifelse(rowSums(z_mu), rowSums(z_mu), 1.0)
+
+    -rowSums(log(p^p))
+  })
+
+  rowMeans(do.call(cbind, sim))
+}
+
+posterior_effect <- function(var, div, beta, gamma, mu) {
+  x <- matrix(0, nrow = 101, ncol = 2)
+  colnames(x) <- c("apa_spruce", "apa_douglas")
+  x[, var] <- seq(0, 1, by = 0.01)
+
+  if (div == "richness") fn <- expected_richness
+  if (div == "shannon") fn <- expected_shannon
+
+  p <- mclapply(seq_along(beta), function(i) {
+    val <- fn(x, beta[[i]], gamma[[i]], mu[[i]])
+    data.frame(var, div, i, x = x[, var], val)
+  }, mc.cores = 10)
+
+  do.call(rbind, p)
+}
+
+p <- do.call(rbind, list(
+  posterior_effect("apa_spruce", "richness", beta, gamma, mu),
+  posterior_effect("apa_douglas", "richness", beta, gamma, mu),
+  posterior_effect("apa_spruce", "shannon", beta, gamma, mu),
+  posterior_effect("apa_douglas", "shannon", beta, gamma, mu)
+))
+
+p <- p %>%
+  mutate(
+    var = factor(
+      var,
+      levels = c("apa_spruce", "apa_douglas"),
+      labels = c("APA Spruce", "APA Douglas")
+    ),
+    div = factor(
+      div,
+      levels = c("richness", "shannon"),
+      labels = c("Species richness", "Shannon diversity")
+    )
+  )
+
+pmean <- p %>%
+  group_by(var, div, x) %>%
+  summarize(val = mean(val), .groups = "drop")
+
+ggplot(p) +
+  geom_line(aes(x, val, group = i), alpha = 0.01) +
+  geom_line(aes(x, val), data = pmean, color = 2, linewidth = 1) +
+  facet_grid(vars(div), vars(var), scales = "free") +
+  labs(x = NULL, y = NULL)
+```

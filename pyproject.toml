@@ -1,0 +1,31 @@
+[project]
+name = "mscm"
+dynamic = ["version"]
+description = "Multi-species count models for Liesel"
+authors = [{name = "Hannes Riebl", email = "hriebl@uni-goettingen.de"}]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+
+dependencies = ["liesel==0.2.3"]
+
+[build-system]
+requires = ["pdm-pep517>=1.0.0"]
+build-backend = "pdm.pep517.api"
+
+[tool]
+[tool.black]
+line-length = 120
+
+[tool.isort]
+line_length = 120
+
+[tool.pdm]
+version = {source = "file", path = "src/mscm/__init__.py"}
+
+[tool.pdm.dev-dependencies]
+dev = ["mypy", "pdoc", "pre-commit", "pytest"]
+
+[tool.pdm.scripts]
+docs = "pdoc mscm"
+lint = "pre-commit run -a"
+test = "pytest"
